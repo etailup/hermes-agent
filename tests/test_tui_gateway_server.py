@@ -7,6 +7,8 @@ import types
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from tui_gateway import server
 
 
@@ -30,6 +32,61 @@ class _BrokenStdout:
 
     def flush(self) -> None:
         return None
+
+
+def _drain_process_completion_queue() -> None:
+    try:
+        from tools.process_registry import process_registry
+    except Exception:
+        return
+
+    while not process_registry.completion_queue.empty():
+        try:
+            process_registry.completion_queue.get_nowait()
+        except Exception:
+            break
+    try:
+        process_registry._completion_consumed.clear()
+    except Exception:
+        pass
+
+
+def _cleanup_server_sessions() -> None:
+    sessions = getattr(server, "_sessions", {})
+    try:
+        items = list(sessions.items())
+    except Exception:
+        items = []
+
+    for _sid, session in items:
+        if not isinstance(session, dict):
+            continue
+        stop = session.get("_notif_stop")
+        if stop is not None:
+            try:
+                stop.set()
+            except Exception:
+                pass
+        worker = session.get("slash_worker")
+        if worker is not None and hasattr(worker, "close"):
+            try:
+                worker.close()
+            except Exception:
+                pass
+
+    try:
+        sessions.clear()
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tui_gateway_server_state():
+    _cleanup_server_sessions()
+    _drain_process_completion_queue()
+    yield
+    _cleanup_server_sessions()
+    _drain_process_completion_queue()
 
 
 def test_write_json_serializes_concurrent_writes(monkeypatch):
@@ -4444,6 +4501,9 @@ def test_browser_manage_connect_defaults_to_loopback(monkeypatch):
 
 
 def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
+    import platform
+
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
     emitted: list[tuple[str, dict]] = []
     monkeypatch.setattr(
